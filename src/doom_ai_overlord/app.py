@@ -1,12 +1,8 @@
-"""Doom AI Overlord — single-window desktop app, terminal aesthetic.
+"""Console app: watch the agent play in a terminal-style window, and record demos.
 
 The whole UI is drawn on one Tk canvas: monospace phosphor-green on near-black, dotted game
-viewport, model probabilities, estimates, performance and rails counters — in the style of
-a local intelligence console. Also records a shareable demo video:
-
-    uv run python doom_app.py                      # live console, episodes loop until closed
-    uv run python doom_app.py --scenario deadly_corridor
-    uv run python doom_app.py --record docs/assets/demo.mp4    # headless demo video
+viewport, model probabilities, estimates, performance and rails counters. Also records a
+shareable GIF of the app itself (--capture) and an H.264 gameplay video (--record).
 
 Keys: SPACE pause · R reset episode · Q quit
 """
@@ -20,19 +16,18 @@ from collections import deque
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
-from play_doom import (
+from .agent import episode_steps, resolve_scenario_path, setup_game
+from .decisions import (
     DEFAULT_GOALS,
     GOAL_PRESETS,
     KILL_THRESHOLD,
     build_action_maps,
     detect_capabilities,
-    episode_steps,
     make_questions,
-    resolve_scenario_path,
-    setup_game,
 )
+from .hud import hardware_info, hud_overlay
 
 # ---------------------------------------------------------------- terminal palette
 BG = "#0a0e0b"
@@ -56,98 +51,6 @@ PERF_ORDER = ["INFERENCE", "P95 RESPONSE", "DECISIONS", "ENGINE", "DEVICE", "NET
 
 F = lambda s, b=False: ("Consolas", s, "bold") if b else ("Consolas", s)
 
-
-# ---------------------------------------------------------------- HUD for the demo video
-
-def _pil_font(size):
-    for name in ("arial.ttf", "DejaVuSans.ttf"):
-        try:
-            return ImageFont.truetype(name, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
-def _bar_color(frac):
-    if frac > 0.5:
-        return (90, 200, 90)
-    if frac > 0.25:
-        return (230, 200, 60)
-    return (230, 80, 70)
-
-
-def hud_overlay(frame_rgb, ev, hw_line, flashes):
-    """HUD burned into recorded video frames (the app console draws its own chrome)."""
-    img = Image.fromarray(frame_rgb).convert("RGBA")
-    w, h = img.size
-    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(ov)
-    f_big, f_sm, f_tiny = _pil_font(18), _pil_font(14), _pil_font(11)
-
-    d.rectangle([0, 0, w, 34], fill=(0, 0, 0, 165))
-    hp = ev["health"]
-    d.text((8, 1), "HP", font=f_tiny, fill=(200, 200, 200, 255))
-    if hp is not None:
-        frac = max(0.0, min(1.0, hp / 100.0))
-        d.rectangle([8, 15, 150, 29], fill=(70, 70, 70, 255))
-        d.rectangle([8, 15, 8 + int(142 * frac), 29], fill=_bar_color(frac))
-        d.text((156, 8), str(hp), font=f_big, fill=(255, 255, 255, 255))
-    else:
-        d.text((8, 15), "n/a", font=f_sm, fill=(200, 200, 200, 255))
-    ammo = ev["geom"]["ammo"]
-    d.text((220, 1), "AMMO", font=f_tiny, fill=(200, 200, 200, 255))
-    if ammo is not None:
-        frac = max(0.0, min(1.0, ammo / 50.0))
-        d.rectangle([220, 15, 320, 29], fill=(70, 70, 70, 255))
-        d.rectangle([220, 15, 220 + int(100 * frac), 29], fill=_bar_color(frac))
-        d.text((326, 8), str(ammo), font=f_big, fill=(255, 255, 255, 255))
-    else:
-        d.text((220, 15), "n/a", font=f_sm, fill=(200, 200, 200, 255))
-    d.text((400, 8), f"FRAGS {ev['kills']}", font=f_big, fill=(255, 220, 120, 255))
-    d.text((520, 10), f"{ev['episode_tics']} tics", font=f_sm, fill=(220, 220, 220, 255))
-
-    d.rectangle([0, 34, w, 52], fill=(0, 0, 0, 120))
-    d.text((8, 37), hw_line, font=f_tiny, fill=(170, 170, 170, 255))
-
-    d.rectangle([0, h - 42, w, h], fill=(0, 0, 0, 165))
-    src_col = (120, 220, 130, 255) if not ev["used_fallback"] else (240, 170, 80, 255)
-    d.text((10, h - 34), f"ACT {ev['choice']}", font=f_sm, fill=src_col)
-    d.text((10, h - 16), f"{ev['conf'] * 100:3.0f}% conf · {ev['dt_ms']:3.0f} ms · {ev['tics']} tics",
-           font=f_tiny, fill=(200, 200, 200, 255))
-    d.text((250, h - 34), f"PRIO {ev['priority']} ({ev['priority_src']})", font=f_sm,
-           fill=(160, 200, 255, 255))
-    dp = ev["danger_p"]
-    d.rectangle([430, h - 30, 540, h - 16], fill=(70, 70, 70, 255))
-    d.rectangle([430, h - 30, 430 + int(110 * dp), h - 16], fill=_bar_color(1.0 - dp))
-    d.text((546, h - 34), f"danger {dp:.2f}", font=f_tiny, fill=(220, 220, 220, 255))
-    tgt = ev["state_dict"]
-    d.text((430, h - 16), f"{tgt['target']}/{tgt['range']} {ev['geom']['offset_px']}px",
-           font=f_tiny, fill=(200, 200, 200, 255))
-
-    y = 60
-    for text_s, color, _expiry in flashes:
-        box = d.textbbox((0, 0), text_s, font=f_big)
-        x = (w - (box[2] - box[0])) // 2
-        d.text((x, y), text_s, font=f_big, fill=color, stroke_width=2, stroke_fill=(0, 0, 0, 255))
-        y += 26
-
-    return Image.alpha_composite(img, ov).convert("RGB")
-
-
-def hardware_info(args, scenario_base, goals):
-    cuda = torch.cuda.is_available()
-    return {
-        "GPU": torch.cuda.get_device_name(0) if cuda else "CPU only",
-        "torch": torch.__version__,
-        "CUDA": torch.version.cuda or "-",
-        "model": args.model,
-        "device": args.device,
-        "scenario": scenario_base,
-        "goals": f"survival={goals['survival']}, pressure={goals['pressure']}",
-    }
-
-
-# ---------------------------------------------------------------- pipeline (shared with CLI)
 
 def run_pipeline(args, gui_queue=None, writer=None, stop=None, cmd_queue=None):
     scenario_file = resolve_scenario_path(args.scenario)
@@ -258,7 +161,7 @@ def run_pipeline(args, gui_queue=None, writer=None, stop=None, cmd_queue=None):
         game.close()
 
 
-# ---------------------------------------------------------------- demo video recording
+# ---------------------------------------------------------------- demo recording
 
 def run_record(args):
     import subprocess
@@ -393,7 +296,6 @@ def run_app(args):
                 "val": reg(text(RIGHT_X + RIGHT_W, y, "0.00", 10, LABEL, anchor="e")),
             }
             reg(cv.create_rectangle(760, y - 6, 940, y + 6, outline="", fill=FAINT))
-            # keep fill above its background
             cv.tag_raise(row["fill"])
             prob_rows[name] = row
             y += 24
@@ -403,7 +305,8 @@ def run_app(args):
         ui["exec_val"] = reg(text(RIGHT_X + 110, y, "", 13, GREEN, bold=True))
         ui["exec_src"] = reg(text(RIGHT_X + RIGHT_W, y, "", 9, DIM, anchor="e"))
         y += 30
-        ui["danger_lbl"], ui["danger_fill"], ui["danger_val"] = meter_row(y, "DANGER ESTIMATE")
+        _lbl, ui["danger_fill"], ui["danger_val"] = meter_row(y, "DANGER ESTIMATE")
+        reg(_lbl)
         y += 26
         ui["prio_lbl"] = reg(text(RIGHT_X, y, "PRIORITY", 10, LABEL))
         ui["prio_val"] = reg(text(RIGHT_X + 110, y, "", 11, TXT, bold=True))
@@ -423,7 +326,6 @@ def run_app(args):
         ui["rails_val"] = reg(text(RIGHT_X + RIGHT_W, y, "rails interventions   0000",
                                    10, GREEN, anchor="e"))
 
-    # model header (static position)
     model_hdr = text(RIGHT_X, 108, "Laya System-1", 11, GREEN, bold=True)
     model_sub = text(RIGHT_X, 126, "connecting…", 9, DIM)
     text(RIGHT_X, 156, "NEXT ACTION", 10, LABEL)

@@ -1,7 +1,9 @@
 # Agent Design — Laya plays Doom
 
-How `play_doom.py` drives `defend_the_center.cfg` with `convaiinnovations/laya`, and why each
-piece is the way it is. Grounded in `docs/laya-model.md` and `docs/vizdoom-defend-the-center.md`.
+How `doom_ai_overlord.agent.episode_steps` drives `defend_the_center.cfg` with
+`convaiinnovations/laya`, and why each piece is the way it is. (Module layout:
+`perception.py`, `decisions.py`, `agent.py`, `app.py` — see CONTRIBUTING.md.)
+Grounded in `docs/laya-model.md` and `docs/vizdoom-defend-the-center.md`.
 
 ## Pipeline (per decision step)
 

@@ -16,7 +16,7 @@ goals, and hard safety rails.
 ## Demo
 
 The console app running live (frameless capture, recorded once the model is loaded —
-`uv run python doom_app.py --capture docs/assets/app-demo.gif --capture-seconds 32`):
+`uv run doom-app --capture docs/assets/app-demo.gif --capture-seconds 32`):
 
 ![Doom AI Overlord console app](docs/assets/app-demo.gif)
 
@@ -24,13 +24,13 @@ Watch it live with the desktop app — the game view plus a stats sidebar (hardw
 state, vitals, response-time performance, key bindings, events):
 
 ```bash
-uv run python doom_app.py
+uv run doom-app
 ```
 
 Record your own demo video:
 
 ```bash
-uv run python doom_app.py --record demo.mp4 --poster demo_poster.jpg
+uv run doom-app --record docs/assets/demo.mp4 --poster docs/assets/demo_poster.jpg
 ```
 
 ## Results (verified, RTX 3060)
@@ -56,16 +56,16 @@ The Laya model (~850 MB) downloads automatically from Hugging Face on first run.
 
 ```bash
 # Watch it play (game window)
-uv run python play_doom.py
+uv run doom-agent
 
 # A different scenario
-uv run python play_doom.py --scenario deadly_corridor
+uv run doom-agent --scenario deadly_corridor
 
 # Headless, short smoke test
-uv run python play_doom.py --headless --episodes 1 --max-steps 60
+uv run doom-agent --headless --episodes 1 --max-steps 60
 
 # Tune the goals (engine reward shaping)
-uv run python play_doom.py --survival 2.0 --pressure 0.5
+uv run doom-agent --survival 2.0 --pressure 0.5
 ```
 
 Options: `--scenario` (default `defend_the_center.cfg`), `--episodes`, `--max-steps`,
@@ -94,18 +94,31 @@ Full details in [`docs/`](docs/):
 ## Repository layout
 
 ```
-play_doom.py   the agent (perception, questions, rails, actuation)
-doom_app.py    desktop console app (live view + stats) and demo video recorder
-docs/assets/   demo video, poster and UI previews
-docs/          research notes and design decisions
-pyproject.toml uv project; torch pinned to the CUDA 12.6 index
+src/doom_ai_overlord/
+  perception.py   labels -> state dict + geometry (what the agent sees)
+  decisions.py    capabilities, action maps, Laya questions, goal arbiter, safety rails
+  agent.py        game setup + episode_steps(), the pipeline everything drives
+  cli.py          doom-agent: terminal runner
+  app.py          doom-app: console UI + GIF/video recorders
+  hud.py          HUD overlay + hardware info for recordings
+docs/             research notes and design decisions
+docs/assets/      demo GIF and previews
+pyproject.toml    uv project; torch pinned to the CUDA 12.6 index
 ```
+
+## Contributing
+
+Contributions are welcome — scenarios, behaviors, stats, docs. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for setup, the module map, and how to verify behavior
+changes, and the [issue tracker](https://github.com/JohGirard/doom-ai-overlord/issues) for
+`good first issue` entries. Be excellent to each other:
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## Roadmap
 
 - [ ] Session logging — record every decision (state, model answers, reward) as training data
 - [ ] Fine-tune Laya on session trajectories (RLCD-style, using the package's own training helpers)
-- [ ] Custom scenario (custom WAD) tuned to expose the agent's weaknesses
+push- [ ] Custom scenario (custom WAD) tuned to expose the agent's weaknesses
 
 ## License
 

@@ -10,7 +10,7 @@ labels: bug
 **Command used**:
 
 ```bash
-uv run python play_doom.py ...
+uv run doom-agent ...
 ```
 
 **What happened**:
