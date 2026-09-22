@@ -1,0 +1,17 @@
+[project]
+name = "doom-ai-overlord"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "laya>=0.3.4",
+    "torch>=2.14.0",
+    "vizdoom>=1.3.1",
+]
+
+# CUDA-enabled torch wheels (RTX 3060, driver CUDA 13.x -> cu126 builds)
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
