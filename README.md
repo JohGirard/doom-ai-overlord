@@ -1,14 +1,37 @@
 # Doom AI Overlord
 
-Doom played autonomously by a **System-1 decision model** — not an LLM planner, not a
-reinforcement learning policy. The [convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya)
-model (the open Apache-2.0 alternative to TypeSafe's proprietary "Jev") answers tactical
-questions about a compact game state in a single forward pass, and
-[ViZDoom](https://vizdoom.farama.org/) executes its decisions in real time.
+**A 421M-parameter decision model plays Doom — one forward pass per decision, ~55 ms,
+fully local, no LLM in the loop.**
+
+Every choice in the demo below is a single forward pass of
+[convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya) (the open Apache-2.0
+alternative to TypeSafe's proprietary "Jev") over a compact game state — no chain-of-thought,
+no cloud, no Doom-specific training. [ViZDoom](https://vizdoom.farama.org/) executes its
+decisions in real time.
 
 A curiosity, but a deliberate one: it's a test bench for how far a small, fast, calibrated
 decision model can get on a reactive control problem when you give it clean geometry, honest
 goals, and hard safety rails.
+
+## Demo
+
+The console app running live (frameless capture, recorded once the model is loaded —
+`uv run python doom_app.py --capture docs/assets/app-demo.gif --capture-seconds 32`):
+
+![Doom AI Overlord console app](docs/assets/app-demo.gif)
+
+Watch it live with the desktop app — the game view plus a stats sidebar (hardware, agent
+state, vitals, response-time performance, key bindings, events):
+
+```bash
+uv run python doom_app.py
+```
+
+Record your own demo video:
+
+```bash
+uv run python doom_app.py --record demo.mp4 --poster demo_poster.jpg
+```
 
 ## Results (verified, RTX 3060)
 
@@ -72,6 +95,8 @@ Full details in [`docs/`](docs/):
 
 ```
 play_doom.py   the agent (perception, questions, rails, actuation)
+doom_app.py    desktop console app (live view + stats) and demo video recorder
+docs/assets/   demo video, poster and UI previews
 docs/          research notes and design decisions
 pyproject.toml uv project; torch pinned to the CUDA 12.6 index
 ```
@@ -80,7 +105,6 @@ pyproject.toml uv project; torch pinned to the CUDA 12.6 index
 
 - [ ] Session logging — record every decision (state, model answers, reward) as training data
 - [ ] Fine-tune Laya on session trajectories (RLCD-style, using the package's own training helpers)
-- [ ] Comedy mode — the AI commentating its own performance
 - [ ] Custom scenario (custom WAD) tuned to expose the agent's weaknesses
 
 ## License

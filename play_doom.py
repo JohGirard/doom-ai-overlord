@@ -10,6 +10,7 @@ import argparse
 import os
 import time
 
+import numpy as np
 import torch
 import vizdoom as zd
 
@@ -339,6 +340,123 @@ def make_bar(value, max_val: int = 100, length: int = 10) -> str:
     return "#" * filled + "-" * (length - filled)
 
 
+def setup_game(scenario_file: str, window_visible: bool, goals: dict) -> zd.DoomGame:
+    """ViZDoom game instance with labels, HUD and goal shaping configured."""
+    game = zd.DoomGame()
+    game.load_config(scenario_file)
+    game.set_screen_resolution(zd.ScreenResolution.RES_640X480)
+    game.set_labels_buffer_enabled(True)
+    game.set_window_visible(window_visible)
+    game.set_render_hud(True)
+    game.set_render_crosshair(True)
+    # Goal shaping layered on top of the scenario's WAD rewards (engine knobs, 1.3.0+).
+    if goals["survival"]:
+        game.set_damage_taken_penalty(goals["survival"])
+    if goals["pressure"]:
+        game.set_damage_made_reward(goals["pressure"])
+    game.init()
+    return game
+
+
+def episode_steps(game, agent, questions, action_map, caps, kill_threshold, survival, max_steps):
+    """Run one episode, yielding one event dict per decision step.
+
+    Shared by the CLI (play_doom.py) and the desktop app (doom_app.py) so both drive the
+    exact same pipeline. Each event carries the model answers, the rail-enforced choice,
+    counters and the post-action screen frame (HWC uint8, or None when the episode ended).
+    """
+    game.new_episode()
+    step = 0
+    prev_health = None
+    prev_ammo = None
+    kills = 0
+    shots = 0
+    blind_streak = 0
+
+    while step < max_steps:
+        state_dict, geom = analyze_scene(game, prev_health)
+        if state_dict is None:
+            break
+        blind_streak = blind_streak + 1 if state_dict["target"] == "none" else 0
+        geom["blind_streak"] = blind_streak
+
+        # Episode-effort counters feed the priority question.
+        if prev_ammo is not None and geom["ammo"] is not None and geom["ammo"] < prev_ammo:
+            shots += prev_ammo - geom["ammo"]
+        prev_ammo = geom["ammo"]
+        state_dict["kills"] = kills if kill_threshold else "unknown"
+        state_dict["shots"] = shots if geom["ammo"] is not None else "unknown"
+
+        t0 = time.time()
+        res = agent.predict(state_dict, questions)
+        dt = time.time() - t0
+
+        action_ans = res["answers"]["action"]
+        choice = action_ans["choice"]
+        conf = action_ans.get("confidence", 0.0)
+        priority_arb, priority_src = arbitrate_priority(state_dict, geom, caps)
+        model_priority = res["answers"]["priority"]["choice"]
+        priority = priority_arb or model_priority
+        if priority_src is None:
+            priority_src = "model"
+        danger_p = res["answers"]["danger"].get("noul", 0.0)
+
+        choice, used_fallback = apply_rails(choice, state_dict, geom, action_map, caps, priority)
+
+        tics = DANGER_TICS if danger_p > 0.5 else geom["tics"]
+        reward = game.make_action(action_map[choice], tics)
+        step += 1
+
+        # Attribute damage to the tics that just ran.
+        new_state = game.get_state()
+        health_now = geom["health"]
+        if new_state is not None and new_state.game_variables is not None:
+            for i, var in enumerate(game.get_available_game_variables()):
+                if var.name == "HEALTH":
+                    health_now = int(new_state.game_variables[i])
+        hp_lost = (geom["health"] - health_now) if (health_now is not None and geom["health"] is not None) else 0
+        prev_health = health_now
+
+        # Kill accounting is per-scenario (WAD kill rewards differ). The survival
+        # penalty shares the same reward window, so add it back before thresholding.
+        adjusted = reward + hp_lost * survival
+        prev_kills = kills
+        if kill_threshold and adjusted >= kill_threshold:
+            kills += max(1, int(adjusted // kill_threshold))
+
+        frame = None
+        if new_state is not None and new_state.screen_buffer is not None:
+            frame = np.ascontiguousarray(np.transpose(new_state.screen_buffer, (1, 2, 0)))
+
+        yield {
+            "step": step,
+            "dt_ms": dt * 1000,
+            "state_dict": state_dict,
+            "geom": geom,
+            "choice": choice,
+            "conf": conf,
+            "probs": action_ans.get("probabilities", {}),
+            "priority": priority,
+            "priority_src": priority_src,
+            "danger_p": danger_p,
+            "used_fallback": used_fallback,
+            "tics": tics,
+            "reward": reward,
+            "hp_lost": hp_lost,
+            "health": health_now,
+            "kills": kills,
+            "kills_delta": kills - prev_kills,
+            "shots": shots,
+            "total_reward": game.get_total_reward(),
+            "episode_tics": game.get_episode_time(),
+            "alive": new_state is not None,
+            "frame": frame,
+        }
+
+        if new_state is None:
+            break
+
+
 def main():
     default_device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -381,19 +499,7 @@ def main():
 
     agent = Agent(args.model, device=args.device)
 
-    game = zd.DoomGame()
-    game.load_config(scenario_file)
-    game.set_screen_resolution(zd.ScreenResolution.RES_640X480)
-    game.set_labels_buffer_enabled(True)
-    game.set_window_visible(not args.headless)
-    game.set_render_hud(True)
-    game.set_render_crosshair(True)
-    # Goal shaping layered on top of the scenario's WAD rewards (engine knobs, 1.3.0+).
-    if goals["survival"]:
-        game.set_damage_taken_penalty(goals["survival"])
-    if goals["pressure"]:
-        game.set_damage_made_reward(goals["pressure"])
-    game.init()
+    game = setup_game(scenario_file, window_visible=not args.headless, goals=goals)
 
     caps = detect_capabilities(game)
     action_map = build_action_maps(game, caps)
@@ -405,88 +511,36 @@ def main():
     try:
         for ep in range(1, args.episodes + 1):
             print(f">>> BEGINNING EPISODE {ep}/{args.episodes} <<<")
-            game.new_episode()
-            step = 0
             total_inference_time = 0.0
-            prev_health = None
-            prev_ammo = None
-            kills = 0
-            shots = 0
-            blind_streak = 0
+            step = 0
 
-            while step < args.max_steps:
-                state_dict, geom = analyze_scene(game, prev_health)
-                if state_dict is None:
-                    break
-                blind_streak = blind_streak + 1 if state_dict["target"] == "none" else 0
-                geom["blind_streak"] = blind_streak
+            for ev in episode_steps(game, agent, questions, action_map, caps, kill_threshold, goals["survival"], args.max_steps):
+                total_inference_time += ev["dt_ms"]
+                step = ev["step"]
 
-                # Episode-effort counters feed the priority question.
-                if prev_ammo is not None and geom["ammo"] is not None and geom["ammo"] < prev_ammo:
-                    shots += prev_ammo - geom["ammo"]
-                prev_ammo = geom["ammo"]
-                state_dict["kills"] = kills if kill_threshold else "unknown"
-                state_dict["shots"] = shots if geom["ammo"] is not None else "unknown"
+                if ev["kills_delta"] > 0:
+                    print(f"  [KILL] +{ev['kills_delta']} frag(s) -> total {ev['kills']} | episode reward {ev['total_reward']:.1f}")
+                if ev["hp_lost"] > 0:
+                    print(f"  [DAMAGE] Took a hit: {ev['geom']['health']} -> {ev['health']} HP")
 
-                t0 = time.time()
-                res = agent.predict(state_dict, questions)
-                dt = time.time() - t0
-                total_inference_time += dt
-
-                action_ans = res["answers"]["action"]
-                choice = action_ans["choice"]
-                conf = action_ans.get("confidence", 0.0)
-                priority_arb, priority_src = arbitrate_priority(state_dict, geom, caps)
-                model_priority = res["answers"]["priority"]["choice"]
-                priority = priority_arb or model_priority
-                if priority_src is None:
-                    priority_src = "model"
-                danger_p = res["answers"]["danger"].get("noul", 0.0)
-
-                choice, used_fallback = apply_rails(choice, state_dict, geom, action_map, caps, priority)
-
-                tics = DANGER_TICS if danger_p > 0.5 else geom["tics"]
-                reward = game.make_action(action_map[choice], tics)
-                step += 1
-
-                # Attribute damage to the tics that just ran.
-                new_state = game.get_state()
-                health_now = geom["health"]
-                if new_state is not None and new_state.game_variables is not None:
-                    for i, var in enumerate(game.get_available_game_variables()):
-                        if var.name == "HEALTH":
-                            health_now = int(new_state.game_variables[i])
-                hp_lost = (geom["health"] - health_now) if (health_now is not None and geom["health"] is not None) else 0
-                if hp_lost > 0:
-                    print(f"  [DAMAGE] Took a hit: {geom['health']} -> {health_now} HP")
-                prev_health = health_now
-
-                # Kill accounting is per-scenario (WAD kill rewards differ). The survival
-                # penalty shares the same reward window, so add it back before thresholding.
-                adjusted = reward + hp_lost * goals["survival"]
-                if kill_threshold and adjusted >= kill_threshold:
-                    new_kills = max(1, int(adjusted // kill_threshold))
-                    kills += new_kills
-                    print(f"  [KILL] +{new_kills} frag(s) -> total {kills} | episode reward {game.get_total_reward():.1f}")
-
+                health_now = ev["health"]
+                geom = ev["geom"]
                 hp_str = f"{health_now:3d}" if health_now is not None else "  -"
                 hp_bar = make_bar(health_now, 100, 8) if health_now is not None else "-" * 8
                 ammo_str = f"{geom['ammo']:2d}" if geom["ammo"] is not None else " -"
                 ammo_bar = make_bar(geom["ammo"], 50, 6) if geom["ammo"] is not None else "-" * 6
-                src = "geo" if used_fallback else "model"
+                src = "geo" if ev["used_fallback"] else "model"
+                sd = ev["state_dict"]
                 print(
-                    f"[{step:03d} | {dt * 1000:4.1f}ms] "
+                    f"[{step:03d} | {ev['dt_ms']:4.1f}ms] "
                     f"HP: {hp_str} {hp_bar} | "
                     f"Ammo: {ammo_str} {ammo_bar} | "
-                    f"Frags: {kills:2d} | "
-                    f"Danger: {danger_p:4.2f} | "
-                    f"Act: {choice:s} ({conf * 100:3.0f}%, {src}) | "
-                    f"Prio: {priority:s} ({priority_src}) | "
-                    f"{state_dict['target']:s}/{state_dict['range']:s} {geom['offset_px']:3d}px {geom['target_name']}"
+                    f"Frags: {ev['kills']:2d} | "
+                    f"Danger: {ev['danger_p']:4.2f} | "
+                    f"Act: {ev['choice']:s} ({ev['conf'] * 100:3.0f}%, {src}) | "
+                    f"Prio: {ev['priority']:s} ({ev['priority_src']}) | "
+                    f"{sd['target']:s}/{sd['range']:s} {geom['offset_px']:3d}px {geom['target_name']}"
                 )
-
-                if new_state is None:
-                    break
 
             timed_out = game.is_episode_timeout_reached()
             reward = game.get_total_reward()
@@ -494,7 +548,7 @@ def main():
 
             print("-" * 60)
             print(f"  EPISODE {ep} COMPLETE — {'survived to timeout' if timed_out else 'episode ended'}")
-            print(f"  - Frags / Kills       : {kills}")
+            print(f"  - Frags / Kills       : {ev['kills'] if step > 0 else 0}")
             print(f"  - Total Reward        : {reward:.1f}")
             print(f"  - Decision Steps      : {step} ({game.get_episode_time()} tics)")
             print(f"  - Avg Inference       : {avg_lat:.2f} ms")
